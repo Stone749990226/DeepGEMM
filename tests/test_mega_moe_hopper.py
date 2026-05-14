@@ -583,24 +583,36 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     # overlap 校正：扣掉 fused 中无法重叠的串行 reduction 段后估计稳态吞吐
     approx_factor = t_fused / max(t_fused - t_reduction, 1e-12)
 
-    # 与 SM100 test_mega_moe.py 输出格式对齐
-    legacy_label = (
-        f"{safe_div(t_baseline, t_fused):.2f}x legacy-per128"
-        if ep_buffer is not None
-        else "(no baseline: deep_ep unavailable)"
+    # baseline 用同一份 FLOPs / HBM 字节，时间换成 t_baseline
+    tflops_baseline = safe_div(
+        2 * num_recv_tokens * (hidden * intermediate_hidden * 3) / 1e12, t_baseline
     )
+    hbm_gbs_baseline = safe_div(num_hbm_bytes / 1e9, t_baseline)
+    nvlink_gbs_baseline = safe_div(num_nvlink_bytes / 1e9, t_baseline)
+
     dist_print("Performance:", once_in_node=True)
     dist_print(
-        f" > EP: {rank_idx:2}/{num_ranks} | "
+        f" > [fused]    EP {rank_idx:2}/{num_ranks} | "
         f"{tflops:4.0f} TFLOPS | "
-        f"overlap: "
-        f"{tflops * approx_factor:4.0f} TFLOPS, "
+        f"overlap: {tflops * approx_factor:4.0f} TFLOPS, "
         f"HBM {hbm_gbs * approx_factor:4.0f} GB/s, "
         f"NVL {nvlink_gbs * approx_factor:3.0f} GB/s | "
-        f"{t_fused * 1e6:4.0f} us, "
-        f"reduction: {t_reduction * 1e6:4.1f} us | "
-        f"{legacy_label}"
+        f"{t_fused * 1e6:6.0f} us, "
+        f"reduction: {t_reduction * 1e6:5.1f} us"
     )
+    if ep_buffer is not None:
+        speedup = safe_div(t_baseline, t_fused)
+        dist_print(
+            f" > [baseline] EP {rank_idx:2}/{num_ranks} | "
+            f"{tflops_baseline:4.0f} TFLOPS | "
+            f"               HBM {hbm_gbs_baseline:4.0f} GB/s, "
+            f"NVL {nvlink_gbs_baseline:3.0f} GB/s | "
+            f"{t_baseline * 1e6:6.0f} us | "
+            f"t_baseline/t_fused = {speedup:.2f}x "
+            f"({'fused 更快' if speedup > 1 else 'baseline 更快'})"
+        )
+    else:
+        dist_print(" > [baseline] (no baseline: deep_ep unavailable)", once_in_node=True)
 
     # ---- 清理 ----
     dist.barrier()
