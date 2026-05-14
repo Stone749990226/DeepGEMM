@@ -1010,12 +1010,12 @@ sm90_fp8_mega_moe_impl(void* y,
                 }
 
                 // Apply token weight: SwiGLU * topk_weight (single load per row)
-                float weight_r0 = *l1_topk_weights_buffer
-                    .get_data_buffer(m_idx + epilogue_wg_idx * WG_BLOCK_M + r_0)
-                    .get_base_ptr<float>();
-                float weight_r1 = *l1_topk_weights_buffer
-                    .get_data_buffer(m_idx + epilogue_wg_idx * WG_BLOCK_M + r_1)
-                    .get_base_ptr<float>();
+                const auto weight_buf_r0 = l1_topk_weights_buffer
+                    .get_data_buffer(m_idx + epilogue_wg_idx * WG_BLOCK_M + r_0);
+                const auto weight_buf_r1 = l1_topk_weights_buffer
+                    .get_data_buffer(m_idx + epilogue_wg_idx * WG_BLOCK_M + r_1);
+                float weight_r0 = *static_cast<float*>(weight_buf_r0.get_base_ptr());
+                float weight_r1 = *static_cast<float*>(weight_buf_r1.get_base_ptr());
                 #pragma unroll
                 for (uint32_t p = 0; p < kNumPairs; ++ p) {
                     swiglu_r0[p][0] *= weight_r0;

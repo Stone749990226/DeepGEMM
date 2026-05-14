@@ -126,7 +126,13 @@ def transform_weights_for_mega_moe_sm90(
         half = n // 2
         gate = t[:, :half].reshape(g, half // gran, gran, *rest)
         up = t[:, half:].reshape(g, half // gran, gran, *rest)
-        return torch.empty_like(t).copy_(torch.stack([gate, up], dim=2).reshape(g, n, *rest))
+        # `torch.stack`/`torch.cat` are not implemented for FP8 tensors on
+        # some PyTorch builds. Use strided copies into the final layout instead.
+        out = torch.empty_like(t)
+        out_view = out.reshape(g, half // gran, 2, gran, *rest)
+        out_view[:, :, 0].copy_(gate)
+        out_view[:, :, 1].copy_(up)
+        return out
 
     return (_interleave_one(l1_fp8), l1_sf), l2_weights
 
