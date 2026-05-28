@@ -93,6 +93,7 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -113,7 +114,8 @@ static void __instantiate_kernel() {{
     args.reuse_accum_as_final ? "true" : "false",
     args.l2_arrival_counter ? "true" : "false",
     args.skip_l2_epilogue_sync ? "true" : "false",
-    args.split_phase_hot_path ? "true" : "false");
+    args.split_phase_hot_path ? "true" : "false",
+    args.config.cluster_size);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {

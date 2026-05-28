@@ -422,12 +422,28 @@ static MegaMoESM90Config get_mega_moe_config_sm90(
         expected_tokens_per_expert >= 64.0f;
     const int block_n = auto_split_mn ? 256 : 128;
     const int block_k = 128;
-    // NOTES: cluster_size=1 for SM90 in this initial implementation. Cluster=2
-    // multicast on A is feasible (each pair of CTAs shares m_block, splits N),
-    // but the SwiGLU/FP8-quantize epilogue would then need cross-CTA amax
-    // reduction so that one per-128 SF correctly covers both 64-col halves.
-    // We defer that optimisation; cluster=1 is correct and self-contained.
-    const int cluster_size = 1;
+    // NOTES: cluster_size=2 enables TMA multicast on A and SFA (both CTAs in
+    // the cluster pair share `m_block_idx`). Currently scoped to the
+    // BLOCK_N=256 path: each CTA owns wg_split_n=2 epilogue warpgroups whose
+    // 128 joint post-SwiGLU columns coincide with one per-64 K L2-acts SF
+    // group on each CTA, so the existing per-row amax / per-64 SF layout
+    // remains correct without any cross-CTA exchange.
+    //
+    // BLOCK_N=128 (Llama-style) is intentionally NOT enabled here because each
+    // CTA produces only 64 post-SwiGLU columns and a per-128 K SF would need
+    // DSMEM cross-CTA amax — that work is deferred to a follow-up.
+    //
+    // Default-on for eligible shapes; set `DG_SM90_MEGA_MOE_DISABLE_CLUSTER=1`
+    // to force cluster=1 fallback. Ineligible shapes (BLOCK_N!=256, odd
+    // L1/L2 N-block counts, odd `num_sms`) silently fall back without the env.
+    const bool can_cluster2 =
+        block_n == 256 and
+        (intermediate_hidden % (block_n * 2) == 0) and
+        (hidden % (block_n * 2) == 0) and
+        (num_sms % 2 == 0);
+    const bool disable_cluster =
+        get_env<int>("DG_SM90_MEGA_MOE_DISABLE_CLUSTER", 0) != 0;
+    const int cluster_size = (can_cluster2 and not disable_cluster) ? 2 : 1;
     const int num_max_pool_tokens = layout::get_num_max_pool_tokens(
         num_ranks, num_max_tokens_per_rank, num_topk, num_experts_per_rank);
     const int swizzle_acts_mode = 128;

@@ -95,6 +95,7 @@ template <
     bool kL2ArrivalCounter,
     bool kSkipL2EpilogueSync,
     bool kSplitPhaseHotPath,
+    uint32_t kClusterSize,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -328,8 +329,11 @@ sm90_fp8_mega_moe_impl(void* y,
                 // Two producer warps (A+SFA loader, B+SFB loader) each call
                 // `arrive_and_expect_tx` per stage, so init count must be 2.
                 full_barriers[i]->init(kSplitSFALoaderWarp ? 3 : 2);
-                // Each math warp arrives once per stage release.
-                empty_barriers[i]->init(kNumEpilogueWarps);
+                // Each math warp arrives once per CTA per stage release. With
+                // cluster=2 every math warp sends one extra `arrive(target_cta)`
+                // to the peer CTA's empty barrier (mirrors `sm90_bf16_gemm.cuh`),
+                // so the expected count is `kNumEpilogueWarps * kClusterSize`.
+                empty_barriers[i]->init(kNumEpilogueWarps * kClusterSize);
             }
             #pragma unroll
             for (uint32_t i = 0; i < kNumCombineWarps * 2; ++ i)
@@ -337,17 +341,29 @@ sm90_fp8_mega_moe_impl(void* y,
         }
         cutlass::arch::fence_barrier_init();
     }
-    __syncthreads();
+    // Make the freshly-initialised barriers visible. With cluster=2 we need a
+    // cluster-wide sync so the peer CTA can see this CTA's barrier state
+    // before any cluster-multicast TMA fires (mirrors `sm90_bf16_gemm.cuh`).
+    if constexpr (kClusterSize > 1) {
+        cute::cluster_sync();
+    } else {
+        __syncthreads();
+    }
 
     // =====================================================================
-    // Scheduler (cluster=1)
+    // Scheduler
     // =====================================================================
+    // `kClusterSize` is plumbed as a kernel template parameter so the heuristic
+    // can flip cluster=1 vs cluster=2 (TMA multicast on A) without rebuilding
+    // call sites. Cluster-aware kernel logic (multicast, cross-CTA amax) is
+    // implemented separately; while `kClusterSize == 1` the rest of this kernel
+    // behaves exactly as before.
     auto scheduler = sched::MegaMoEScheduler<
         BLOCK_M, BLOCK_N, BLOCK_K,
         L1_SHAPE_N, L1_SHAPE_K,
         L2_SHAPE_N, L2_SHAPE_K,
         kNumExpertsPerRank, kNumExpertsPerWave,
-        kNumSMs, kNumRanks, /*kClusterSize=*/1u, kNMajorSchedule, kMBlockInterleaveGroup>(workspace);
+        kNumSMs, kNumRanks, kClusterSize, kNMajorSchedule, kMBlockInterleaveGroup>(workspace);
 
     // Pipeline state shared by TMA loaders and math warpgroups
     uint32_t stage_idx = 0, phase = 0;
@@ -715,20 +731,25 @@ sm90_fp8_mega_moe_impl(void* y,
                     const uint32_t m_idx = pool_block_idx * BLOCK_M;
                     const uint32_t k_idx = k_block_idx * BLOCK_K;
 
-                    // TMA load A
+                    // TMA load A. With kClusterSize=2 the two CTAs in the
+                    // cluster share `m_block_idx`, so A is identical and the
+                    // multicast version delivers the same source bytes to both
+                    // CTAs' SMEM in one TMA. `tma::copy` internally elects the
+                    // leader CTA for the multicast and is a no-op on followers.
                     tma::copy<BLOCK_K, LOAD_BLOCK_M, kSwizzleAMode, a_dtype_t>(
                         tensor_map_a_ptr, full_barriers[stage_idx], smem_a[stage_idx],
-                        k_idx, m_idx, 1);
+                        k_idx, m_idx, kClusterSize);
 
                     if constexpr (kSplitSFALoaderWarp) {
                         full_barriers[stage_idx]->arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE);
                     } else {
-                        // TMA load SFA
+                        // TMA load SFA. SFA is also indexed by (m, k) only, so
+                        // it can be multicast alongside A under cluster=2.
                         if (block_phase == sched::BlockPhase::Linear1) {
                             // L1 SFA per-128: load (BLOCK_M, 1) at K=k_block_idx
                             tma::copy<BLOCK_M, 1, 0, float>(
                                 tensor_map_sfa_ptr, full_barriers[stage_idx], smem_sfa[stage_idx],
-                                m_idx, k_block_idx, 1);
+                                m_idx, k_block_idx, kClusterSize);
                             full_barriers[stage_idx]->arrive_and_expect_tx(
                                 SMEM_A_SIZE_PER_STAGE + BLOCK_M * sizeof(float));
                         } else {
@@ -737,11 +758,11 @@ sm90_fp8_mega_moe_impl(void* y,
                             // 0 and BLOCK_M to match math's load offsets (`+ 0 * BLOCK_M` / `+ 1 * BLOCK_M`).
                             tma::copy<BLOCK_M, 1, 0, float>(
                                 tensor_map_sfa_ptr, full_barriers[stage_idx], smem_sfa[stage_idx],
-                                m_idx, k_block_idx * 2, 1);
+                                m_idx, k_block_idx * 2, kClusterSize);
                             tma::copy<BLOCK_M, 1, 0, float>(
                                 tensor_map_sfa_ptr, full_barriers[stage_idx],
                                 smem_sfa[stage_idx] + BLOCK_M,
-                                m_idx, k_block_idx * 2 + 1, 1);
+                                m_idx, k_block_idx * 2 + 1, kClusterSize);
                             full_barriers[stage_idx]->arrive_and_expect_tx(
                                 SMEM_A_SIZE_PER_STAGE + 2 * BLOCK_M * sizeof(float));
                         }
@@ -774,6 +795,14 @@ sm90_fp8_mega_moe_impl(void* y,
                                          const uint32_t& m_block_idx, const uint32_t& n_block_idx) {
                 process_a_sfa_block(block_phase, local_expert_idx, num_k_blocks, m_block_idx, n_block_idx);
             });
+        }
+
+        // With cluster=2 the empty barriers are distributed-shared. Spin one
+        // extra round so the peer CTA's release path can complete before the
+        // cluster tears those barriers down (mirrors `sm90_bf16_gemm.cuh:198`).
+        if constexpr (kClusterSize > 1) {
+            for (uint32_t i = 0; i < kNumStages; advance_pipeline(i))
+                empty_barriers[stage_idx]->wait(phase ^ 1);
         }
 
     } else if (warp_idx == kNumDispatchWarps + 1) {
@@ -818,6 +847,12 @@ sm90_fp8_mega_moe_impl(void* y,
             }
         });
 
+        // Cluster=2 distributed-barrier teardown safety; see comment above.
+        if constexpr (kClusterSize > 1) {
+            for (uint32_t i = 0; i < kNumStages; advance_pipeline(i))
+                empty_barriers[stage_idx]->wait(phase ^ 1);
+        }
+
     } else if (warp_idx == kNumDispatchWarps + 2 and kSplitSFALoaderWarp) {
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
@@ -860,22 +895,28 @@ sm90_fp8_mega_moe_impl(void* y,
                     if (block_phase == sched::BlockPhase::Linear1) {
                         tma::copy<BLOCK_M, 1, 0, float>(
                             tensor_map_sfa_ptr, full_barriers[stage_idx], smem_sfa[stage_idx],
-                            m_idx, k_block_idx, 1);
+                            m_idx, k_block_idx, kClusterSize);
                         full_barriers[stage_idx]->arrive_and_expect_tx(BLOCK_M * sizeof(float));
                     } else {
                         tma::copy<BLOCK_M, 1, 0, float>(
                             tensor_map_sfa_ptr, full_barriers[stage_idx], smem_sfa[stage_idx],
-                            m_idx, k_block_idx * 2, 1);
+                            m_idx, k_block_idx * 2, kClusterSize);
                         tma::copy<BLOCK_M, 1, 0, float>(
                             tensor_map_sfa_ptr, full_barriers[stage_idx],
                             smem_sfa[stage_idx] + BLOCK_M,
-                            m_idx, k_block_idx * 2 + 1, 1);
+                            m_idx, k_block_idx * 2 + 1, kClusterSize);
                         full_barriers[stage_idx]->arrive_and_expect_tx(2 * BLOCK_M * sizeof(float));
                     }
                 }
                 __syncwarp();
             }
         });
+
+        // Cluster=2 distributed-barrier teardown safety; see comment above.
+        if constexpr (kClusterSize > 1) {
+            for (uint32_t i = 0; i < kNumStages; advance_pipeline(i))
+                empty_barriers[stage_idx]->wait(phase ^ 1);
+        }
 
     } else if (warp_idx < kNumDispatchWarps + kNumMMANonEpilogueWarps) {
         // Idle non-epilogue warps (kNumDispatchWarps+2, +3). They must still
@@ -905,6 +946,20 @@ sm90_fp8_mega_moe_impl(void* y,
 
         // Sync with dispatch in the full communication path.
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+
+        // Cluster-aware empty-barrier arrival. With cluster=1 only lane 0 of
+        // each math warp arrives at this CTA's barrier (one arrival per warp).
+        // With cluster=2 every math warp also arrives at the peer CTA's
+        // barrier via `arrive(target_cta=lane_idx)`, so the matching init
+        // count at construction is `kNumEpilogueWarps * kClusterSize`. Mirrors
+        // the pattern in `sm90_bf16_gemm.cuh`.
+        auto empty_barrier_arrive = [&](uint32_t s) {
+            if constexpr (kClusterSize == 1) {
+                if (lane_idx == 0) empty_barriers[s]->arrive();
+            } else {
+                if (lane_idx < kClusterSize) empty_barriers[s]->arrive(lane_idx);
+            }
+        };
 
         auto process_math_block = [&](const auto& block_phase,
                                       const uint32_t& local_expert_idx,
@@ -1100,8 +1155,7 @@ sm90_fp8_mega_moe_impl(void* y,
                             for (uint32_t i = 0; i < kAccumPerThread; ++ i) ptx::warpgroup_fence_operand(final_accum[i]);
                             ptx::warpgroup_wait<0>();
 
-                            if (lane_idx == 0)
-                                empty_barriers[stage_idx]->arrive();
+                            empty_barrier_arrive(stage_idx);
 
                             prev_scale_a_0 = scale_a_0_lo;
                             prev_scale_a_1 = scale_a_1_lo;
@@ -1148,8 +1202,7 @@ sm90_fp8_mega_moe_impl(void* y,
                             for (uint32_t i = 0; i < kAccumPerThread; ++ i) ptx::warpgroup_fence_operand(final_accum[i]);
                             ptx::warpgroup_wait<0>();
 
-                            if (lane_idx == 0)
-                                empty_barriers[stage_idx]->arrive();
+                            empty_barrier_arrive(stage_idx);
 
                             prev_scale_a_0 = scale_a_0_hi;
                             prev_scale_a_1 = scale_a_1_hi;
@@ -1218,8 +1271,7 @@ sm90_fp8_mega_moe_impl(void* y,
                             for (uint32_t i = 0; i < kAccumPerThread; ++ i) ptx::warpgroup_fence_operand(final_accum[i]);
                             ptx::warpgroup_wait<0>();
 
-                            if (lane_idx == 0)
-                                empty_barriers[stage_idx]->arrive();
+                            empty_barrier_arrive(stage_idx);
 
                             postscale_l1_final(scale_a_0_lo, scale_a_1_lo, gate_sf, up_sf);
                         } else {
@@ -1262,8 +1314,7 @@ sm90_fp8_mega_moe_impl(void* y,
                             for (uint32_t i = 0; i < kAccumPerThread; ++ i) ptx::warpgroup_fence_operand(final_accum[i]);
                             ptx::warpgroup_wait<0>();
 
-                            if (lane_idx == 0)
-                                empty_barriers[stage_idx]->arrive();
+                            empty_barrier_arrive(stage_idx);
 
                             postscale_l2_final(scale_a_0_hi, scale_a_1_hi, l2_sf);
                         }
@@ -1363,8 +1414,7 @@ sm90_fp8_mega_moe_impl(void* y,
 
                     if (have_prev) {
                         ptx::warpgroup_wait<1>();
-                        if (lane_idx == 0)
-                            empty_barriers[prev_stage]->arrive();
+                        empty_barrier_arrive(prev_stage);
                         accumulate_l1_group(get_accum(prev_buf),
                                             prev_scale_a_0, prev_scale_a_1,
                                             prev_gate_sf, prev_up_sf);
@@ -1382,8 +1432,7 @@ sm90_fp8_mega_moe_impl(void* y,
 
                 if (have_prev) {
                     ptx::warpgroup_wait<0>();
-                    if (lane_idx == 0)
-                        empty_barriers[prev_stage]->arrive();
+                    empty_barrier_arrive(prev_stage);
                     accumulate_l1_group(get_accum(prev_buf),
                                         prev_scale_a_0, prev_scale_a_1,
                                         prev_gate_sf, prev_up_sf);
@@ -1397,8 +1446,7 @@ sm90_fp8_mega_moe_impl(void* y,
                 auto consume_prev_l2 = [&]() {
                     if (have_prev) {
                         ptx::warpgroup_wait<1>();
-                        if (prev_release_stage and lane_idx == 0)
-                            empty_barriers[prev_stage]->arrive();
+                        if (prev_release_stage) empty_barrier_arrive(prev_stage);
                         accumulate_l2_group(get_accum(prev_buf),
                                             prev_scale_a_0, prev_scale_a_1,
                                             prev_l2_sf);
@@ -1446,8 +1494,7 @@ sm90_fp8_mega_moe_impl(void* y,
 
                 if (have_prev) {
                     ptx::warpgroup_wait<0>();
-                    if (prev_release_stage and lane_idx == 0)
-                        empty_barriers[prev_stage]->arrive();
+                    if (prev_release_stage) empty_barrier_arrive(prev_stage);
                     accumulate_l2_group(get_accum(prev_buf),
                                         prev_scale_a_0, prev_scale_a_1,
                                         prev_l2_sf);
@@ -1526,8 +1573,7 @@ sm90_fp8_mega_moe_impl(void* y,
                     for (uint32_t i = 0; i < kAccumPerThread; ++ i) ptx::warpgroup_fence_operand(accum[i]);
                     ptx::warpgroup_wait<0>();
 
-                    if (lane_idx == 0)
-                        empty_barriers[stage_idx]->arrive();
+                    empty_barrier_arrive(stage_idx);
 
                     // L1: gate/up alternate at gran=8 along N; each `i` block of 8
                     // cols belongs entirely to one of {gate, up}, so .x and .y
@@ -1586,8 +1632,7 @@ sm90_fp8_mega_moe_impl(void* y,
                     for (uint32_t i = 0; i < kAccumPerThread; ++ i) ptx::warpgroup_fence_operand(accum[i]);
                     ptx::warpgroup_wait<0>();
 
-                    if (lane_idx == 0)
-                        empty_barriers[stage_idx]->arrive();
+                    empty_barrier_arrive(stage_idx);
 
                     // L2 second half: same broadcast scalar `l2_sf`.
                     #pragma unroll
